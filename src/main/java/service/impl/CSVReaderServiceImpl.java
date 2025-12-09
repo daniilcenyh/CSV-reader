@@ -16,22 +16,44 @@ import service.CSVReaderService;
 import java.io.*;
 import java.math.BigDecimal;
 import java.time.LocalDate;
-import java.time.format.DateTimeFormatter;
 import java.util.*;
 
+/**
+ * Реализация сервиса для чтения и парсинга CSV-файлов со сведениями о сотрудниках.
+ * <p>
+ * Поддерживает:
+ * <ul>
+ *   <li>Чтение из classpath (src/main/resources)</li>
+ *   <li>Разделитель — точка с запятой (;)</li>
+ *   <li>Кэширование подразделений</li>
+ *   <li>Валидацию объектов через Hibernate Validator</li>
+ *   <li>Гибкий парсинг дат и пола</li>
+ * </ul>
+ * </p>
+ */
 public class CSVReaderServiceImpl implements CSVReaderService {
 
     private static final char CSV_SEPARATOR = ';';
-    private static final DateTimeFormatter DATE_FORMATTER = DateTimeFormatter.ofPattern("dd.MM.yyyy");
+    /** Валидатор для проверки объектов Person */
     private final Validator validator;
+
+    /** Кэш подразделений: код подразделения → объект Department */
     private final Map<String, Department> departmentCache = new HashMap<>();
 
+    /** Создаёт сервис и инициализирует валидатор */
     public CSVReaderServiceImpl() {
         try (ValidatorFactory factory = Validation.buildDefaultValidatorFactory()) {
             this.validator = factory.getValidator();
         }
     }
 
+    /**
+     * Читает сотрудников из CSV-файла, расположенного в classpath.
+     *
+     * @param csvFilePath путь к файлу в ресурсах (например, "people.csv")
+     * @return список успешно распарсенных и валидированных сотрудников
+     * @throws IOException если файл не найден или произошла ошибка чтения
+     */
     @Override
     public List<Person> readPeopleFromCSV(String csvFilePath) throws IOException {
         List<Person> people = new ArrayList<>();
@@ -39,32 +61,52 @@ public class CSVReaderServiceImpl implements CSVReaderService {
         try (InputStream in = getClass().getClassLoader().getResourceAsStream(csvFilePath)) {
             if (in == null) {
                 throw new FileNotFoundException("Файл не найден в ресурсах: " + csvFilePath +
-                        "\nУбедитесь, что файл находится в src/main/resources/");
+                        "\nПоместите файл в src/main/resources/");
             }
 
-            // Диагностика первой строки
-            System.out.println("=== НАЧАЛО ОБРАБОТКИ CSV ===");
+            // Для диагностики сначала прочитаем первые строки
+            System.out.println("=== ДИАГНОСТИКА ФАЙЛА ===");
 
-            try (CSVReader reader = new CSVReaderBuilder(new InputStreamReader(in, "UTF-8"))
+            // Создаем BufferedReader для диагностики
+            BufferedReader diagnosticReader = new BufferedReader(new InputStreamReader(in, "UTF-8"));
+
+            // Читаем первые 3 строки для диагностики
+            System.out.println("Первые 3 строки файла:");
+            for (int i = 0; i < 3; i++) {
+                String line = diagnosticReader.readLine();
+                if (line != null) {
+                    System.out.println((i+1) + ": " + line);
+                    System.out.println("   Разделение по ';': " + Arrays.toString(line.split(";")));
+                    System.out.println("   Длина строки: " + line.length());
+                }
+            }
+
+            diagnosticReader.close();
+
+            // Закрываем и переоткрываем поток
+            in.close();
+
+            // Снова открываем поток для CSVReader
+            InputStream newIn = getClass().getClassLoader().getResourceAsStream(csvFilePath);
+            if (newIn == null) {
+                throw new FileNotFoundException("Не удалось переоткрыть файл: " + csvFilePath);
+            }
+
+            // Используем правильный конструктор CSVReader
+            try (CSVReader reader = new CSVReaderBuilder(new InputStreamReader(newIn, "UTF-8"))
                     .withCSVParser(new CSVParserBuilder()
                             .withSeparator(CSV_SEPARATOR)
                             .withQuoteChar('"')
+                            .withEscapeChar('\\')
                             .build())
-                    .withSkipLines(0) // Пропустим заголовок вручную
+                    .withSkipLines(1) // Пропускаем заголовок
                     .build()) {
 
-                String[] header = reader.readNext();
-                if (header == null) {
-                    throw new IOException("Файл пустой");
-                }
-
-                System.out.println("Заголовок файла: " + Arrays.toString(header));
-                System.out.println("Ожидаемый формат: [id, name, gender, BirtDate, Division, Salary]");
-
                 String[] nextLine;
-                int lineNumber = 1; // Уже прочитали заголовок
-                int successCount = 0;
-                int errorCount = 0;
+                int lineNumber = 0;
+                int processedCount = 0;
+
+                System.out.println("\n=== НАЧАЛО ОБРАБОТКИ ===");
 
                 while ((nextLine = reader.readNext()) != null) {
                     lineNumber++;
@@ -75,55 +117,40 @@ public class CSVReaderServiceImpl implements CSVReaderService {
                         continue;
                     }
 
-                    // Выводим информацию о первых 3 строках данных
+                    // Выводим информацию о первых 5 строках
                     if (lineNumber <= 5) {
-                        System.out.println("\nСтрока " + (lineNumber-1) + " (индекс в файле: " + lineNumber + "):");
-                        System.out.println("  Raw data: " + Arrays.toString(nextLine));
-                        System.out.println("  Field count: " + nextLine.length);
+                        System.out.println("Строка " + lineNumber + ":");
+                        System.out.println("  Raw: " + Arrays.toString(nextLine));
+                        System.out.println("  Длина массива: " + nextLine.length);
+                        for (int i = 0; i < nextLine.length; i++) {
+                            System.out.println("  [" + i + "]: '" + nextLine[i] + "'");
+                        }
                     }
 
                     try {
-                        Person person = parsePerson(nextLine, lineNumber);
+                        Person person = parsePerson(nextLine, lineNumber); // Вызываем с 2 параметрами
                         validatePerson(person);
                         people.add(person);
-                        successCount++;
+                        processedCount++;
 
-                        // Выводим информацию о первых 3 успешно обработанных записях
-                        if (successCount <= 3) {
-                            System.out.printf("✓ Успешно обработан: %s (ID: %d, Отдел: %s, Дата: %s, ЗП: %.0f)%n",
-                                    person.getName(), person.getId(),
-                                    person.getDepartment().getName(),
-                                    person.getBirthDate().format(DateTimeFormatter.ofPattern("dd.MM.yyyy")),
-                                    person.getSalary());
+                        // Выводим информацию о первых 3 успешных записях
+                        if (processedCount <= 3) {
+                            System.out.printf("✓ Успешно: %s (ID: %d, Отдел: %s)%n",
+                                    person.getName(), person.getId(), person.getDepartment().getName());
                         }
 
                     } catch (IllegalArgumentException e) {
-                        errorCount++;
-                        if (errorCount <= 5) {
-                            System.err.printf("✗ Ошибка в строке %d: %s%n", lineNumber, e.getMessage());
+                        if (lineNumber <= 10) { // Ограничиваем вывод ошибок
+                            System.err.println("✗ Ошибка в строке " + lineNumber + ": " + e.getMessage());
                             System.err.println("  Данные: " + Arrays.toString(nextLine));
                         }
                     }
                 }
 
-                System.out.println("\n=== СТАТИСТИКА ОБРАБОТКИ ===");
-                System.out.println("Всего строк данных: " + (lineNumber - 1));
-                System.out.println("Успешно обработано: " + successCount);
-                System.out.println("Ошибок обработки: " + errorCount);
-                System.out.println("Уникальных подразделений: " + departmentCache.size());
-
-                // Выводим информацию о подразделениях
-                System.out.println("\nСписок подразделений:");
-                List<Department> sortedDepartments = new ArrayList<>(departmentCache.values());
-                sortedDepartments.sort(Comparator.comparing(Department::getName));
-
-                for (Department dept : sortedDepartments) {
-                    long employeeCount = people.stream()
-                            .filter(p -> p.getDepartment().equals(dept))
-                            .count();
-                    System.out.printf("  %s (ID: %d) - сотрудников: %d%n",
-                            dept.getName(), dept.getId(), employeeCount);
-                }
+                System.out.println("\n=== РЕЗУЛЬТАТЫ ===");
+                System.out.println("Всего строк прочитано: " + lineNumber);
+                System.out.println("Успешно обработано: " + processedCount);
+                System.out.println("Ошибок: " + (lineNumber - processedCount));
 
             } catch (CsvValidationException e) {
                 throw new IOException("Ошибка валидации CSV", e);
@@ -136,163 +163,148 @@ public class CSVReaderServiceImpl implements CSVReaderService {
         return Collections.unmodifiableList(people);
     }
 
+    /**
+     * Возвращает кэш подразделений.
+     *
+     * @return неизменяемую копию кэша подразделений (код → объект)
+     */
     @Override
     public Map<String, Department> getDepartmentCache() {
         return Collections.unmodifiableMap(departmentCache);
     }
 
+    // Старый метод (оставляем для обратной совместимости, если где-то используется)
+    private Person parsePerson(String[] csvLine) {
+        return parsePerson(csvLine, -1); // Вызываем новый метод с номером строки -1
+    }
+
+    // Новый метод с номером строки для лучшего сообщения об ошибках
     private Person parsePerson(String[] csvLine, int lineNumber) {
-        // Проверяем количество полей
         if (csvLine.length < 6) {
-            throw new IllegalArgumentException(
-                    String.format("Строка %d: Недостаточно данных. Ожидается 6 полей, получено: %d. " +
-                                    "Проверьте правильность разделителя ';'",
-                            lineNumber, csvLine.length));
+            String errorMsg = "Недостаточно данных в строке. Ожидается 6 полей, получено: " + csvLine.length;
+            if (lineNumber > 0) {
+                errorMsg = "Строка " + lineNumber + ": " + errorMsg;
+            }
+            throw new IllegalArgumentException(errorMsg);
         }
 
         try {
-            // 1. ID (поле 0)
-            Long id = parseId(csvLine[0].trim(), lineNumber);
+            // ID
+            Long id;
+            try {
+                id = Long.parseLong(csvLine[0].trim());
+            } catch (NumberFormatException e) {
+                // Если ID не число, используем номер строки или генерируем
+                if (lineNumber > 0) {
+                    id = (long) lineNumber;
+                } else {
+                    id = System.currentTimeMillis() % 1000000; // Простой генератор
+                }
+                System.out.printf("  Строка %d: Используется сгенерированный ID: %d%n",
+                        lineNumber > 0 ? lineNumber : 0, id);
+            }
 
-            // 2. Имя (поле 1)
+            // Имя
             String name = csvLine[1].trim();
             if (name.isEmpty()) {
-                throw new IllegalArgumentException("Имя не может быть пустым");
+                name = "Неизвестно_" + id;
+                if (lineNumber > 0) {
+                    System.out.printf("  Строка %d: Пустое имя, заменено на: %s%n", lineNumber, name);
+                }
             }
 
-            // 3. Пол (поле 2) - Male/Female
-            Gender gender = parseGender(csvLine[2].trim(), lineNumber);
-
-            // 4. Дата рождения (поле 3) - формат dd.MM.yyyy
-            LocalDate birthDate = parseBirthDate(csvLine[3].trim(), lineNumber);
-
-            // 5. Подразделение (поле 4) - буква (A, B, C, ...)
-            String divisionCode = csvLine[4].trim();
-            if (divisionCode.isEmpty()) {
-                divisionCode = "UNKNOWN";
+            // Пол
+            Gender gender;
+            try {
+                gender = Gender.fromString(csvLine[2].trim());
+            } catch (IllegalArgumentException e) {
+                gender = Gender.MALE; // Значение по умолчанию
+                if (lineNumber > 0) {
+                    System.out.printf("  Строка %d: Неизвестный пол '%s', используется MALE%n",
+                            lineNumber, csvLine[2].trim());
+                }
             }
 
-            // Создаем читаемое название подразделения
-            String departmentName = "Отдел " + divisionCode;
+            // Подразделение
+            String departmentName = csvLine[3].trim();
+            if (departmentName.isEmpty()) {
+                departmentName = "Без_отдела";
+            }
             Department department = departmentCache.computeIfAbsent(
-                    divisionCode, // Используем код как ключ
-                    code -> new Department("Отдел " + code)
+                    departmentName,
+                    Department::new
             );
 
-            // 6. Зарплата (поле 5)
-            BigDecimal salary = parseSalary(csvLine[5].trim(), lineNumber);
-
-            Person person = new Person(id, name, gender, department, salary, birthDate);
-
-            // Дополнительная проверка даты (должна быть в прошлом)
-            if (birthDate.isAfter(LocalDate.now())) {
-                System.err.printf("  Внимание: строка %d - дата рождения в будущем: %s%n",
-                        lineNumber, birthDate);
+            // Зарплата
+            BigDecimal salary;
+            String salaryStr = csvLine[4].trim().replace(",", ".");
+            if (salaryStr.isEmpty()) {
+                salary = BigDecimal.ZERO;
+            } else {
+                try {
+                    salary = new BigDecimal(salaryStr);
+                } catch (NumberFormatException e) {
+                    salary = BigDecimal.ZERO;
+                    if (lineNumber > 0) {
+                        System.err.printf("  Строка %d: Некорректная зарплата '%s', используется 0%n",
+                                lineNumber, salaryStr);
+                    }
+                }
             }
 
-            // Дополнительная проверка зарплаты
-            if (salary.compareTo(BigDecimal.ZERO) <= 0) {
-                System.err.printf("  Внимание: строка %d - некорректная зарплата: %.2f%n",
-                        lineNumber, salary);
-            }
-
-            return person;
-
-        } catch (NumberFormatException e) {
-            throw new IllegalArgumentException(
-                    String.format("Строка %d: Ошибка преобразования числа", lineNumber), e);
-        } catch (IllegalArgumentException e) {
-            // Перебрасываем с указанием номера строки
-            throw new IllegalArgumentException(
-                    String.format("Строка %d: %s", lineNumber, e.getMessage()), e);
-        }
-    }
-
-    private Long parseId(String idStr, int lineNumber) {
-        if (idStr.isEmpty()) {
-            // Генерируем ID на основе номера строки
-            return (long) lineNumber * 1000L;
-        }
-
-        try {
-            return Long.parseLong(idStr);
-        } catch (NumberFormatException e) {
-            throw new IllegalArgumentException("Некорректный ID: " + idStr);
-        }
-    }
-
-    private Gender parseGender(String genderStr, int lineNumber) {
-        if (genderStr == null || genderStr.trim().isEmpty()) {
-            System.err.printf("  Внимание: строка %d - пол не указан, используется MALE%n", lineNumber);
-            return Gender.MALE;
-        }
-
-        String upperGender = genderStr.trim().toUpperCase();
-
-        switch (upperGender) {
-            case "MALE":
-            case "M":
-            case "МУЖ":
-            case "МУЖСКОЙ":
-                return Gender.MALE;
-
-            case "FEMALE":
-            case "F":
-            case "ЖЕН":
-            case "ЖЕНСКИЙ":
-                return Gender.FEMALE;
-
-            default:
-                System.err.printf("  Внимание: строка %d - неизвестный пол '%s', используется MALE%n",
-                        lineNumber, genderStr);
-                return Gender.MALE;
-        }
-    }
-
-    private LocalDate parseBirthDate(String dateStr, int lineNumber) {
-        if (dateStr == null || dateStr.trim().isEmpty()) {
-            throw new IllegalArgumentException("Дата рождения не может быть пустой");
-        }
-
-        String trimmedDate = dateStr.trim();
-
-        try {
-            return LocalDate.parse(trimmedDate, DATE_FORMATTER);
-        } catch (Exception e) {
-            // Пробуем другие форматы
+            // Дата рождения
+            LocalDate birthDate;
+            String dateStr = csvLine[5].trim();
             try {
-                // Пробуем формат с дефисами
-                if (trimmedDate.contains("-")) {
-                    return LocalDate.parse(trimmedDate, DateTimeFormatter.ofPattern("dd-MM-yyyy"));
-                }
-                // Пробуем формат со слешами
-                if (trimmedDate.contains("/")) {
-                    return LocalDate.parse(trimmedDate, DateTimeFormatter.ofPattern("dd/MM/yyyy"));
-                }
-            } catch (Exception e2) {
-                // Не получилось
+                birthDate = Person.parseDate(dateStr);
+            } catch (IllegalArgumentException e) {
+                // Пробуем разные форматы дат
+                birthDate = parseDateFlexible(dateStr, lineNumber);
             }
 
-            throw new IllegalArgumentException("Некорректный формат даты: " + trimmedDate +
-                    " (ожидается дд.мм.гггг)");
+            return new Person(id, name, gender, department, salary, birthDate);
+
+        } catch (NumberFormatException e) {
+            String errorMsg = "Ошибка преобразования числа: " + e.getMessage();
+            if (lineNumber > 0) {
+                errorMsg = "Строка " + lineNumber + ": " + errorMsg;
+            }
+            throw new IllegalArgumentException(errorMsg, e);
+        } catch (IllegalArgumentException e) {
+            String errorMsg = "Ошибка в данных: " + e.getMessage();
+            if (lineNumber > 0) {
+                errorMsg = "Строка " + lineNumber + ": " + errorMsg;
+            }
+            throw new IllegalArgumentException(errorMsg, e);
         }
     }
 
-    private BigDecimal parseSalary(String salaryStr, int lineNumber) {
-        if (salaryStr == null || salaryStr.trim().isEmpty()) {
-            System.err.printf("  Внимание: строка %d - зарплата не указана, используется 0%n", lineNumber);
-            return BigDecimal.ZERO;
+    private LocalDate parseDateFlexible(String dateString, int lineNumber) {
+        if (dateString == null || dateString.trim().isEmpty()) {
+            throw new IllegalArgumentException("Дата не может быть пустой");
         }
 
-        try {
-            // Заменяем запятую на точку для корректного парсинга
-            String normalized = salaryStr.trim().replace(",", ".");
-            return new BigDecimal(normalized);
-        } catch (NumberFormatException e) {
-            System.err.printf("  Внимание: строка %d - некорректная зарплата '%s', используется 0%n",
-                    lineNumber, salaryStr);
-            return BigDecimal.ZERO;
+        dateString = dateString.trim();
+
+        // Пробуем разные форматы дат
+        String[] patterns = {
+                "dd.MM.yyyy", "dd-MM-yyyy", "dd/MM/yyyy",
+                "yyyy.MM.dd", "yyyy-MM-dd", "yyyy/MM/dd",
+                "dd.MM.yy", "dd-MM-yy", "dd/MM/yy",
+                "MM/dd/yyyy", "MM-dd-yyyy", "MM/dd/yy", "MM-dd-yy"
+        };
+
+        for (String pattern : patterns) {
+            try {
+                return LocalDate.parse(dateString, java.time.format.DateTimeFormatter.ofPattern(pattern));
+            } catch (Exception e) {
+                // Пробуем следующий формат
+            }
         }
+
+        // Если ничего не помогло, выбрасываем исключение
+        throw new IllegalArgumentException("Не удалось распознать дату: " + dateString +
+                " (строка " + lineNumber + ")");
     }
 
     private void validatePerson(Person person) {
@@ -300,13 +312,16 @@ public class CSVReaderServiceImpl implements CSVReaderService {
 
         if (!violations.isEmpty()) {
             StringBuilder sb = new StringBuilder();
-            sb.append("Ошибки валидации: ");
+            sb.append("Ошибки валидации для человека с ID=")
+                    .append(person.getId())
+                    .append(":\n");
 
             for (ConstraintViolation<Person> violation : violations) {
-                sb.append(violation.getPropertyPath())
-                        .append(" - ")
+                sb.append("  - ")
+                        .append(violation.getPropertyPath())
+                        .append(": ")
                         .append(violation.getMessage())
-                        .append("; ");
+                        .append("\n");
             }
 
             throw new IllegalArgumentException(sb.toString());
